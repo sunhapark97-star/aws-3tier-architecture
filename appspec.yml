@@ -1,0 +1,39 @@
+version: 0.0
+os: linux
+
+files:
+  - source: /
+    destination: /home/ubuntu/anonymous_project
+    overwrite: yes
+
+permissions:
+  - object: /home/ubuntu/anonymous_project
+    pattern: "**"
+    owner: ubuntu
+    group: ubuntu
+    mode: 0755
+    type:
+      - file
+      - directory
+
+hooks:
+  ApplicationStop:
+    - location: deploy/scripts/10_stop_services.sh
+      timeout: 300
+      runas: root
+  BeforeInstall:
+    - location: deploy/scripts/01_prepare_dirs.sh
+      timeout: 300
+      runas: root
+  AfterInstall:
+    - location: deploy/scripts/02_install_runtime_files.sh
+      timeout: 600
+      runas: root
+  ApplicationStart:
+    - location: deploy/scripts/03_start_services.sh
+      timeout: 600
+      runas: root
+  ValidateService:
+    - location: deploy/scripts/04_validate_service.sh
+      timeout: 300
+      runas: root

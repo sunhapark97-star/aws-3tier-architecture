@@ -1,0 +1,55 @@
+version: 0.2
+
+env:
+  variables:
+    # CloudFormation에서 CodeBuild 환경변수로 주입됨
+    # STATIC_BUCKET: <StaticFilesBucketName>
+    DJANGO_SETTINGS_MODULE: "anonymous_project.settings.production"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "[install] Upgrading pip"
+      - python -m pip install --upgrade pip
+      - |
+        if [ -f requirements.txt ]; then
+          echo "[install] Installing requirements.txt (for tests/build tooling)"
+          pip install -r requirements.txt
+          echo "[install] Building wheelhouse (offline install bundle for EC2)"
+          rm -rf wheelhouse
+          mkdir -p wheelhouse
+          pip wheel -r requirements.txt -w wheelhouse
+        else
+          echo "[install] requirements.txt not found (skip)"
+        fi
+  build:
+    commands:
+      - echo "[build] Collecting static files (best-effort)"
+      - |
+        if [ -f manage.py ]; then
+          # production settings + STATIC_ROOT=./staticfiles 를 권장
+          python manage.py collectstatic --noinput --clear || true
+        fi
+      - echo "[build] Uploading static files to S3 (best-effort)"
+      - |
+        if [ -n "${STATIC_BUCKET:-}" ] && [ -d staticfiles ]; then
+          aws s3 sync staticfiles "s3://${STATIC_BUCKET}/" --delete
+        else
+          echo "[build] STATIC_BUCKET not set or ./staticfiles not found (skip s3 sync)"
+        fi
+      - echo "[build] Packaging artifact for CodeDeploy"
+      - ls -la
+
+artifacts:
+  files:
+    - '**/*'
+  exclude-paths:
+    - '.git/**'
+    - 'venv/**'
+    - '.venv/**'
+    - '**/__pycache__/**'
+    - '**/*.pyc'
+    - '.env'
+  discard-paths: no
