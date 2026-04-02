@@ -1,0 +1,22 @@
+[Unit]
+Description=Gunicorn for anonymous_project (Django)
+After=network.target
+
+[Service]
+User=ubuntu
+Group=www-data
+WorkingDirectory=/home/ubuntu/anonymous_project
+
+EnvironmentFile=-/home/ubuntu/anonymous_project/.env
+Environment="PATH=/home/ubuntu/anonymous_project/venv/bin"
+Environment="DJANGO_SETTINGS_MODULE=anonymous_project.settings.production"
+
+ExecStart=/home/ubuntu/anonymous_project/venv/bin/gunicorn --workers 3 --bind 127.0.0.1:8000 anonymous_project.wsgi:application
+
+Restart=always
+RestartSec=5
+KillSignal=SIGQUIT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
