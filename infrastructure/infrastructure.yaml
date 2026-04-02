@@ -1,0 +1,1494 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  2AZ VPC + ALB (Public) + ASG EC2 Web/App (Private) + RDS MariaDB Multi-AZ (Private DB)
+  + NAT Gateway (per AZ) + S3 Gateway Endpoint + SSM Interface Endpoints
+  + CloudTrail/S3 + CloudWatch/SNS + CodePipeline/CodeBuild/CodeDeploy (optional)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: edu-arch
+    Description: Prefix for resource names and SSM Parameter path.
+  CreatePipeline:
+    Type: String
+    AllowedValues: ['true','false']
+    Default: 'true'
+    Description: Create CodePipeline/CodeBuild resources (true/false).
+
+  GitHubOwner:
+    Type: String
+    Default: your-github-id
+    Description: GitHub owner/user or org name (used by CodePipeline).
+  GitHubRepo:
+    Type: String
+    Default: your-repo-name
+    Description: GitHub repository name (used by CodePipeline).
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: GitHub branch name (used by CodePipeline).
+  CodeStarConnectionArn:
+    Type: String
+    Default: ''
+    Description: CodeStar Connection ARN for GitHub (required if CreatePipeline=true).
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  PublicSubnetACidr:
+    Type: String
+    Default: 10.0.0.0/24
+  PublicSubnetCCidr:
+    Type: String
+    Default: 10.0.1.0/24
+  NatGatewayMode:
+    Type: String
+    Default: single
+    AllowedValues: [single, per-az]
+    Description: "single: NAT in AZ A only (cost-optimized). per-az: NAT in each AZ (higher HA)."
+
+
+  EnableNatAutoFailover:
+    Type: String
+    AllowedValues: ['true','false']
+    Default: 'true'
+    Description: Enable Lambda-based NAT failover automation (CloudWatch Alarm -> EventBridge -> Lambda).
+  EnableNatConnectivityCanary:
+    Type: String
+    AllowedValues: ['true','false']
+    Default: 'true'
+    Description: Enable VPC Lambda canary to test outbound connectivity and raise an alarm.
+
+  PrivateAppSubnetACidr:
+    Type: String
+    Default: 10.0.10.0/24
+  PrivateAppSubnetCCidr:
+    Type: String
+    Default: 10.0.11.0/24
+  PrivateDbSubnetACidr:
+    Type: String
+    Default: 10.0.20.0/24
+  PrivateDbSubnetCCidr:
+    Type: String
+    Default: 10.0.21.0/24
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+    Description: Ubuntu 22.04 LTS AMI from SSM Parameter.
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+  MinSize:
+    Type: Number
+    Default: 2
+  MaxSize:
+    Type: Number
+    Default: 4
+
+  DbName:
+    Type: String
+    Default: appdb
+  DbUser:
+    Type: String
+    Default: appuser
+  DbPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+
+  DjangoSecretKey:
+    Type: String
+    NoEcho: true
+    Default: CHANGE_ME
+    Description: Django SECRET_KEY (stored to SSM SecureString).
+  DjangoAllowedHosts:
+    Type: String
+    Default: "*"
+    Description: Comma-separated ALLOWED_HOSTS (stored to SSM). Use '*' for demo only.
+  DjangoDebug:
+    Type: String
+    AllowedValues: ['true','false']
+    Default: 'false'
+    Description: Django DEBUG flag (stored to SSM).
+
+
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  DbAllocatedStorage:
+    Type: Number
+    Default: 20
+
+Conditions:
+  UsePerAzNat: !Equals [!Ref NatGatewayMode, per-az]
+  EnableFailover: !Equals [!Ref EnableNatAutoFailover, 'true']
+  EnableCanary: !Equals [!Ref EnableNatConnectivityCanary, 'true']
+  EnableCanaryFailover: !And [!Equals [!Ref EnableNatConnectivityCanary, 'true'], !Equals [!Ref EnableNatAutoFailover, 'true']]
+  PipelineReady: !And
+    - !Equals [!Ref CreatePipeline, 'true']
+    - !Not [!Equals [!Ref CodeStarConnectionArn, '']]
+
+Resources:
+  # --------------------
+  # Network
+  # --------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref IGW
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnetACidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-a'
+
+  PublicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnetCCidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-c'
+
+  PrivateAppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateAppSubnetACidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app-a'
+
+  PrivateAppSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateAppSubnetCCidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app-c'
+
+  PrivateDbSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateDbSubnetACidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-a'
+
+  PrivateDbSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateDbSubnetCCidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-c'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetCRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetC
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEipA:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttach
+    Properties:
+      Domain: vpc
+
+  NatEipC:
+    Type: AWS::EC2::EIP
+    Condition: UsePerAzNat
+    DependsOn: IGWAttach
+    Properties:
+      Domain: vpc
+
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-a'
+
+  NatGatewayC:
+    Type: AWS::EC2::NatGateway
+    Condition: UsePerAzNat
+    Properties:
+      AllocationId: !GetAtt NatEipC.AllocationId
+      SubnetId: !Ref PublicSubnetC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-c'
+
+  PrivateAppRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app-rt-a'
+
+  PrivateAppRouteTableC:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app-rt-c'
+
+  AppDefaultRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateAppRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+
+  AppDefaultRouteC:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateAppRouteTableC
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !If [UsePerAzNat, !Ref NatGatewayC, !Ref NatGatewayA]
+
+  PrivateAppSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetA
+      RouteTableId: !Ref PrivateAppRouteTableA
+
+  PrivateAppSubnetCRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetC
+      RouteTableId: !Ref PrivateAppRouteTableC
+
+  PrivateDbRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-rt'
+
+  PrivateDbSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDbSubnetA
+      RouteTableId: !Ref PrivateDbRouteTable
+
+  PrivateDbSubnetCRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDbSubnetC
+      RouteTableId: !Ref PrivateDbRouteTable
+
+  # VPC Endpoints
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateAppRouteTableA
+        - !Ref PrivateAppRouteTableC
+        - !Ref PrivateDbRouteTable
+
+  VpcEndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS from VPC to Interface Endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateAppSubnetA, !Ref PrivateAppSubnetC]
+      SecurityGroupIds: [!Ref VpcEndpointSG]
+
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateAppSubnetA, !Ref PrivateAppSubnetC]
+      SecurityGroupIds: [!Ref VpcEndpointSG]
+
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateAppSubnetA, !Ref PrivateAppSubnetC]
+      SecurityGroupIds: [!Ref VpcEndpointSG]
+
+  # --------------------
+  # Security Groups
+  # --------------------
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateAppSubnetA, !Ref PrivateAppSubnetC]
+      SecurityGroupIds: [!Ref VpcEndpointSG]
+
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  AppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App instances security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSG
+
+  DbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSG
+
+  # --------------------
+  # Load Balancer
+  # --------------------
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-alb'
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetC]
+      SecurityGroups: [!Ref AlbSG]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-tg'
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200-399'
+
+  AlbListenerHttp:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # --------------------
+  # EC2 / ASG
+  # --------------------
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: AppSsmReadAndS3Read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EC2Role]
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-lt'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds: [!Ref AppSG]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+
+            # Basic deps
+            apt-get update -y
+            apt-get install -y ruby wget curl unzip nginx
+
+            # Quick health endpoint via nginx (so ALB healthcheck passes even before first deploy)
+            cat > /etc/nginx/sites-available/healthz <<'EOF'
+            server {
+              listen 80 default_server;
+              server_name _;
+              location = /healthz {
+                access_log off;
+                add_header Content-Type text/plain;
+                return 200 "ok\n";
+              }
+              location / {
+                return 503;
+              }
+            }
+            EOF
+            ln -sf /etc/nginx/sites-available/healthz /etc/nginx/sites-enabled/healthz
+            rm -f /etc/nginx/sites-enabled/default || true
+            nginx -t
+            systemctl enable nginx
+            systemctl restart nginx
+
+            # Install CodeDeploy agent (regional S3)
+            REGION="$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | python3 -c 'import sys,json; print(json.load(sys.stdin)["region"])')"
+            cd /tmp
+            wget -q "https://aws-codedeploy-${REGION}.s3.${REGION}.amazonaws.com/latest/install" -O install
+            chmod +x ./install
+            ./install auto || true
+            systemctl enable codedeploy-agent || true
+            systemctl start codedeploy-agent || true
+
+            # SSM Prefix for deploy script
+            echo "SSM_PREFIX=/${ProjectName}" >> /etc/environment
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: [!Ref PrivateAppSubnetA, !Ref PrivateAppSubnetC]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 180
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app'
+          PropagateAtLaunch: true
+
+  # --------------------
+  # RDS
+  # --------------------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub '${ProjectName} db subnet group'
+      SubnetIds: [!Ref PrivateDbSubnetA, !Ref PrivateDbSubnetC]
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: mariadb
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref DbAllocatedStorage
+      DBName: !Ref DbName
+      MasterUsername: !Ref DbUser
+      MasterUserPassword: !Ref DbPassword
+      MultiAZ: true
+      VPCSecurityGroups: [!Ref DbSG]
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+
+  # --------------------
+  # S3 + CloudTrail
+  # --------------------
+  StaticFilesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Suspended
+
+  CloudTrailLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Suspended
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Suspended
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailLogsBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      S3BucketName: !Ref CloudTrailLogsBucket
+      IsLogging: true
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: false
+      EnableLogFileValidation: false
+
+  # --------------------
+  # SSM Parameters for app env
+  # --------------------
+  DbHostParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/db/host'
+      Type: String
+      Value: !GetAtt RDSInstance.Endpoint.Address
+
+  DbNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/db/name'
+      Type: String
+      Value: !Ref DbName
+
+  DbUserParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/db/user'
+      Type: String
+      Value: !Ref DbUser
+
+  DbPasswordParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/db/password'
+      Type: SecureString
+      Value: !Ref DbPassword
+
+  DjangoSettingsModuleParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/django/settings_module'
+      Type: String
+      Value: anonymous_project.settings.production
+
+  DjangoSecretKeyParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/django/secret_key'
+      Type: SecureString
+      Value: !Ref DjangoSecretKey
+
+  DjangoAllowedHostsParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/django/allowed_hosts'
+      Type: String
+      Value: !Ref DjangoAllowedHosts
+
+  DjangoDebugParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/django/debug'
+      Type: String
+      Value: !Ref DjangoDebug
+
+  StaticBucketParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/app/static_bucket'
+      Type: String
+      Value: !Ref StaticFilesBucket
+
+
+  # --------------------
+  # Observability: SNS + Alarms
+  # --------------------
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-alb-target-5xx'
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ALB.LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroup.TargetGroupFullName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref AlertsTopic]
+      TreatMissingData: notBreaching
+
+  AsgInServiceLowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-asg-inservice-low'
+      Namespace: AWS/AutoScaling
+      MetricName: GroupInServiceInstances
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [!Ref AlertsTopic]
+      TreatMissingData: breaching
+
+  # --------------------
+  # CodeDeploy
+  # --------------------
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub '${ProjectName}-codedeploy'
+      ComputePlatform: Server
+
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub '${ProjectName}-dg'
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      AutoScalingGroups: [!Ref AutoScalingGroup]
+      DeploymentStyle:
+        DeploymentType: IN_PLACE
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: !GetAtt TargetGroup.TargetGroupName
+
+  # --------------------
+  # CodeBuild / CodePipeline (optional)
+  # --------------------
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Condition: PipelineReady
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildS3AndLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+                  - !GetAtt StaticFilesBucket.Arn
+                  - !Sub '${StaticFilesBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:RegisterApplicationRevision
+                Resource: '*'
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Condition: PipelineReady
+    Properties:
+      Name: !Sub '${ProjectName}-build'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: STATIC_BUCKET
+            Value: !Ref StaticFilesBucket
+      Source:
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 30
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Condition: PipelineReady
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+                Resource: !Ref CodeStarConnectionArn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:RegisterApplicationRevision
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:GetDeployment
+                Resource: '*'
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Condition: PipelineReady
+    Properties:
+      Name: !Sub '${ProjectName}-pipeline'
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                ConnectionArn: !Ref CodeStarConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/${GitHubRepo}'
+                BranchName: !Ref GitHubBranch
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: '1'
+              InputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Ref CodeDeployDeploymentGroup
+              RunOrder: 1
+
+
+  # --------------------
+  # NAT Failover Automation (CloudWatch Alarm -> EventBridge -> Lambda)
+  # --------------------
+  NatFailoverTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableFailover
+    Properties:
+      TopicName: !Sub '${ProjectName}-nat-failover'
+
+  NatFailoverLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: EnableFailover
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: NatFailoverPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeNatGateways
+                  - ec2:CreateNatGateway
+                  - ec2:DeleteNatGateway
+                  - ec2:DescribeAddresses
+                  - ec2:AllocateAddress
+                  - ec2:ReleaseAddress
+                  - ec2:CreateTags
+                  - ec2:DescribeRouteTables
+                  - ec2:CreateRoute
+                  - ec2:ReplaceRoute
+                  - ec2:DeleteRoute
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NatFailoverTopic
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                  - ssm:DeleteParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*'
+
+  NatFailoverLambda:
+    Type: AWS::Lambda::Function
+    Condition: EnableFailover
+    Properties:
+      FunctionName: !Sub '${ProjectName}-nat-failover'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt NatFailoverLambdaRole.Arn
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          NAT_GATEWAY_A_ID: !Ref NatGatewayA
+          PUBLIC_SUBNET_C_ID: !Ref PublicSubnetC
+          PRIVATE_ROUTE_TABLE_IDS: !Join [",", [!Ref PrivateAppRouteTableA, !Ref PrivateAppRouteTableC]]
+          FAILOVER_NAT_SSM_KEY: !Sub '/${ProjectName}/ops/failover_nat_id'
+          FAILOVER_EIP_SSM_KEY: !Sub '/${ProjectName}/ops/failover_eip_alloc_id'
+          SNS_TOPIC_ARN: !Ref NatFailoverTopic
+      Code:
+        ZipFile: |
+          import os, time, json, boto3
+          ec2 = boto3.client("ec2")
+          ssm = boto3.client("ssm")
+          sns = boto3.client("sns")
+
+          PROJECT = os.environ["PROJECT_NAME"]
+          NAT_A = os.environ["NAT_GATEWAY_A_ID"]
+          PUB_SUBNET_C = os.environ["PUBLIC_SUBNET_C_ID"]
+          RT_IDS = [x.strip() for x in os.environ["PRIVATE_ROUTE_TABLE_IDS"].split(",") if x.strip()]
+          SSM_NAT_KEY = os.environ["FAILOVER_NAT_SSM_KEY"]
+          SSM_EIP_KEY = os.environ["FAILOVER_EIP_SSM_KEY"]
+          SNS_TOPIC = os.environ["SNS_TOPIC_ARN"]
+
+          TAGS = [{"Key":"Project","Value":PROJECT},{"Key":"ManagedBy","Value":"NatFailoverLambda"},{"Key":"Purpose","Value":"FailoverNat"}]
+
+          def _put_ssm(key, value):
+              ssm.put_parameter(Name=key, Value=value, Type="String", Overwrite=True)
+
+          def _get_ssm(key):
+              try:
+                  return ssm.get_parameter(Name=key)["Parameter"]["Value"]
+              except ssm.exceptions.ParameterNotFound:
+                  return None
+
+          def _del_ssm(key):
+              try:
+                  ssm.delete_parameter(Name=key)
+              except ssm.exceptions.ParameterNotFound:
+                  pass
+
+          def _notify(subject, message):
+              try:
+                  sns.publish(TopicArn=SNS_TOPIC, Subject=subject[:100], Message=message)
+              except Exception:
+                  # don't fail the run because of notification issues
+                  pass
+
+          def _wait_nat_available(nat_id, timeout_s=240):
+              start = time.time()
+              while time.time() - start < timeout_s:
+                  resp = ec2.describe_nat_gateways(NatGatewayIds=[nat_id])
+                  st = resp["NatGateways"][0]["State"]
+                  if st == "available":
+                      return True
+                  if st in ("failed", "deleted"):
+                      raise RuntimeError(f"NAT {nat_id} entered state={st}")
+                  time.sleep(5)
+              raise TimeoutError(f"NAT {nat_id} did not become available in {timeout_s}s")
+
+          def _find_existing_failover_nat():
+              resp = ec2.describe_nat_gateways(
+                  Filter=[
+                      {"Name":"tag:Project","Values":[PROJECT]},
+                      {"Name":"tag:Purpose","Values":["FailoverNat"]},
+                      {"Name":"state","Values":["available","pending"]},
+                  ]
+              )
+              gws = resp.get("NatGateways", [])
+              if not gws:
+                  return None
+              # pick newest
+              gws.sort(key=lambda x: x.get("CreateTime", 0), reverse=True)
+              return gws[0]["NatGatewayId"]
+
+          def _ensure_failover_nat():
+              # First, try SSM state
+              nat_id = _get_ssm(SSM_NAT_KEY)
+              if nat_id:
+                  try:
+                      ec2.describe_nat_gateways(NatGatewayIds=[nat_id])
+                      return nat_id
+                  except Exception:
+                      pass
+
+              nat_id = _find_existing_failover_nat()
+              if nat_id:
+                  _put_ssm(SSM_NAT_KEY, nat_id)
+                  return nat_id
+
+              # Create a new EIP + NAT in Public Subnet C
+              eip = ec2.allocate_address(Domain="vpc")
+              alloc_id = eip["AllocationId"]
+              _put_ssm(SSM_EIP_KEY, alloc_id)
+
+              nat = ec2.create_nat_gateway(SubnetId=PUB_SUBNET_C, AllocationId=alloc_id, TagSpecifications=[
+                  {"ResourceType":"natgateway","Tags":TAGS},
+                  {"ResourceType":"elastic-ip","Tags":TAGS},
+              ])
+              nat_id = nat["NatGateway"]["NatGatewayId"]
+              _put_ssm(SSM_NAT_KEY, nat_id)
+              _wait_nat_available(nat_id)
+              return nat_id
+
+          def _replace_default_route(rt_id, nat_id):
+              try:
+                  ec2.replace_route(RouteTableId=rt_id, DestinationCidrBlock="0.0.0.0/0", NatGatewayId=nat_id)
+              except ec2.exceptions.InvalidRouteNotFound:
+                  ec2.create_route(RouteTableId=rt_id, DestinationCidrBlock="0.0.0.0/0", NatGatewayId=nat_id)
+
+          def failover():
+              nat_id = _ensure_failover_nat()
+              for rt in RT_IDS:
+                  _replace_default_route(rt, nat_id)
+              _notify(f"[{PROJECT}] NAT failover complete",
+                      f"Failover NAT: {nat_id}\nUpdated route tables: {', '.join(RT_IDS)}")
+              return {"action":"failover","failover_nat":nat_id,"route_tables":RT_IDS}
+
+          def rollback():
+              # Restore routes back to NAT A
+              for rt in RT_IDS:
+                  _replace_default_route(rt, NAT_A)
+
+              # Delete failover NAT if it exists
+              nat_id = _get_ssm(SSM_NAT_KEY) or _find_existing_failover_nat()
+              alloc_id = _get_ssm(SSM_EIP_KEY)
+              if nat_id:
+                  try:
+                      # capture alloc_id if missing
+                      if not alloc_id:
+                          desc = ec2.describe_nat_gateways(NatGatewayIds=[nat_id])["NatGateways"][0]
+                          addrs = desc.get("NatGatewayAddresses", [])
+                          if addrs and addrs[0].get("AllocationId"):
+                              alloc_id = addrs[0]["AllocationId"]
+                      ec2.delete_nat_gateway(NatGatewayId=nat_id)
+                  except Exception:
+                      pass
+
+              # Best-effort EIP release (may need to wait until NAT delete completes)
+              if alloc_id:
+                  try:
+                      ec2.release_address(AllocationId=alloc_id)
+                  except Exception:
+                      pass
+
+              _del_ssm(SSM_NAT_KEY)
+              _del_ssm(SSM_EIP_KEY)
+
+              _notify(f"[{PROJECT}] NAT rollback attempted",
+                      f"Routes restored to NAT A: {NAT_A}\nDeleted failover NAT (best-effort): {nat_id}")
+              return {"action":"rollback","nat_a":NAT_A,"route_tables":RT_IDS,"deleted_failover_nat":nat_id}
+
+          def handler(event, context):
+              detail = event.get("detail", {})
+              state = (detail.get("state") or {}).get("value")
+              # Support manual invocation too
+              action = (event.get("action") or "").lower()
+              if action == "failover" or state == "ALARM":
+                  return failover()
+              if action == "rollback" or state == "OK":
+                  return rollback()
+              return {"message":"No action taken", "state":state, "event":event}
+
+  # CloudWatch alarms for NAT Gateway A (signals)
+  NatErrorPortAllocationAlarmA:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableFailover
+    Properties:
+      AlarmName: !Sub '${ProjectName}-natA-ErrorPortAllocation'
+      AlarmDescription: !Sub 'NAT Gateway A could not allocate a source port (${ProjectName}).'
+      Namespace: AWS/NATGateway
+      MetricName: ErrorPortAllocation
+      Dimensions:
+        - Name: NatGatewayId
+          Value: !Ref NatGatewayA
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NatFailoverTopic
+
+  NatPacketsDropAlarmA:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableFailover
+    Properties:
+      AlarmName: !Sub '${ProjectName}-natA-PacketsDropCount'
+      AlarmDescription: !Sub 'NAT Gateway A dropped packets (${ProjectName}).'
+      Namespace: AWS/NATGateway
+      MetricName: PacketsDropCount
+      Dimensions:
+        - Name: NatGatewayId
+          Value: !Ref NatGatewayA
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NatFailoverTopic
+
+  # EventBridge rules: invoke Lambda on Alarm/OK state changes
+  NatFailoverRuleAlarm:
+    Type: AWS::Events::Rule
+    Condition: EnableFailover
+    Properties:
+      Name: !Sub '${ProjectName}-nat-failover-on-alarm'
+      EventPattern:
+        source: ['aws.cloudwatch']
+        detail-type: ['CloudWatch Alarm State Change']
+        detail:
+          alarmName: [!Ref NatErrorPortAllocationAlarmA, !Ref NatPacketsDropAlarmA]
+          state:
+            value: ['ALARM']
+      Targets:
+        - Arn: !GetAtt NatFailoverLambda.Arn
+          Id: NatFailoverLambda
+
+  NatFailoverRuleOk:
+    Type: AWS::Events::Rule
+    Condition: EnableFailover
+    Properties:
+      Name: !Sub '${ProjectName}-nat-failover-on-ok'
+      EventPattern:
+        source: ['aws.cloudwatch']
+        detail-type: ['CloudWatch Alarm State Change']
+        detail:
+          alarmName: [!Ref NatErrorPortAllocationAlarmA, !Ref NatPacketsDropAlarmA]
+          state:
+            value: ['OK']
+      Targets:
+        - Arn: !GetAtt NatFailoverLambda.Arn
+          Id: NatFailoverLambda
+
+  NatFailoverPermissionAlarm:
+    Type: AWS::Lambda::Permission
+    Condition: EnableFailover
+    Properties:
+      FunctionName: !Ref NatFailoverLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NatFailoverRuleAlarm.Arn
+
+  NatFailoverPermissionOk:
+    Type: AWS::Lambda::Permission
+    Condition: EnableFailover
+    Properties:
+      FunctionName: !Ref NatFailoverLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NatFailoverRuleOk.Arn
+
+  # --------------------
+  # NAT Connectivity Canary (VPC Lambda + CloudWatch custom metric)
+  # --------------------
+  MonitoringEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: EnableCanary
+    Properties:
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.monitoring'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateAppSubnetA, !Ref PrivateAppSubnetC]
+      SecurityGroupIds: [!Ref VpcEndpointSG]
+
+  NatCanaryRole:
+    Type: AWS::IAM::Role
+    Condition: EnableCanary
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: NatCanaryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  NatConnectivityCanary:
+    Type: AWS::Lambda::Function
+    Condition: EnableCanary
+    Properties:
+      FunctionName: !Sub '${ProjectName}-nat-canary'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt NatCanaryRole.Arn
+      Timeout: 15
+      VpcConfig:
+        SubnetIds: [!Ref PrivateAppSubnetA, !Ref PrivateAppSubnetC]
+        SecurityGroupIds: [!Ref VpcEndpointSG]
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          TEST_URL: 'https://checkip.amazonaws.com/'
+      Code:
+        ZipFile: |
+          import os, time, urllib.request, boto3
+          cw = boto3.client("cloudwatch")
+          PROJECT = os.environ.get("PROJECT_NAME","project")
+          TEST_URL = os.environ.get("TEST_URL","https://checkip.amazonaws.com/")
+
+          def handler(event, context):
+              ok = 0
+              start = time.time()
+              try:
+                  req = urllib.request.Request(TEST_URL, headers={"User-Agent":"nat-canary"})
+                  with urllib.request.urlopen(req, timeout=3) as r:
+                      data = r.read(64)
+                      ok = 1 if r.status == 200 and len(data) > 0 else 0
+              except Exception:
+                  ok = 0
+
+              # Publish metric via CloudWatch (monitoring) endpoint, so it works even if NAT is down
+              cw.put_metric_data(
+                  Namespace=f"{PROJECT}/NAT",
+                  MetricData=[{
+                      "MetricName":"InternetReachable",
+                      "Dimensions":[{"Name":"Project","Value":PROJECT}],
+                      "Timestamp":time.time(),
+                      "Value": ok,
+                      "Unit":"Count"
+                  }]
+              )
+              return {"ok": ok, "latency_ms": int((time.time()-start)*1000)}
+
+  NatConnectivitySchedule:
+    Type: AWS::Events::Rule
+    Condition: EnableCanary
+    Properties:
+      Name: !Sub '${ProjectName}-nat-canary-schedule'
+      ScheduleExpression: rate(5 minutes)
+      Targets:
+        - Arn: !GetAtt NatConnectivityCanary.Arn
+          Id: NatConnectivityCanary
+
+  NatConnectivitySchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableCanary
+    Properties:
+      FunctionName: !Ref NatConnectivityCanary
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NatConnectivitySchedule.Arn
+
+  NatConnectivityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableCanary
+    Properties:
+      AlarmName: !Sub '${ProjectName}-nat-InternetReachable'
+      AlarmDescription: !Sub 'Outbound Internet reachability from private subnets via NAT (${ProjectName}).'
+      Namespace: !Sub '${ProjectName}/NAT'
+      MetricName: InternetReachable
+      Dimensions:
+        - Name: Project
+          Value: !Ref ProjectName
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !If [EnableFailover, !Ref NatFailoverTopic, !Ref AWS::NoValue]
+
+  NatFailoverRuleAlarmCanary:
+    Type: AWS::Events::Rule
+    Condition: EnableCanaryFailover
+    Properties:
+      Name: !Sub '${ProjectName}-nat-failover-canary-alarm'
+      EventPattern:
+        source: ['aws.cloudwatch']
+        detail-type: ['CloudWatch Alarm State Change']
+        detail:
+          alarmName: [!Ref NatConnectivityAlarm]
+          state:
+            value: ['ALARM']
+      Targets:
+        - Arn: !GetAtt NatFailoverLambda.Arn
+          Id: NatFailoverLambda
+
+  NatFailoverPermissionAlarmCanary:
+    Type: AWS::Lambda::Permission
+    Condition: EnableCanaryFailover
+    Properties:
+      FunctionName: !Ref NatFailoverLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NatFailoverRuleAlarmCanary.Arn
+
+  NatFailoverRuleOkCanary:
+    Type: AWS::Events::Rule
+    Condition: EnableCanaryFailover
+    Properties:
+      Name: !Sub '${ProjectName}-nat-failover-canary-ok'
+      EventPattern:
+        source: ['aws.cloudwatch']
+        detail-type: ['CloudWatch Alarm State Change']
+        detail:
+          alarmName: [!Ref NatConnectivityAlarm]
+          state:
+            value: ['OK']
+      Targets:
+        - Arn: !GetAtt NatFailoverLambda.Arn
+          Id: NatFailoverLambda
+
+  NatFailoverPermissionOkCanary:
+    Type: AWS::Lambda::Permission
+    Condition: EnableCanaryFailover
+    Properties:
+      FunctionName: !Ref NatFailoverLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NatFailoverRuleOkCanary.Arn
+
+Outputs:
+  AlbDnsName:
+    Description: ALB DNS name (create Route53 record if needed)
+    Value: !GetAtt ALB.DNSName
+
+  StaticFilesBucketName:
+    Value: !Ref StaticFilesBucket
+
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+
+  CloudTrailLogsBucketName:
+    Value: !Ref CloudTrailLogsBucket
+
+  DbEndpointAddress:
+    Value: !GetAtt RDSInstance.Endpoint.Address
+
+  SsmParameterPrefix:
+    Value: !Sub '/${ProjectName}'
