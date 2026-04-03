@@ -77,4 +77,4 @@ appspec.yml
 
 ## 📄 Documentation
 
-(Add your PDF link here)
+https://github.com/sunhapark97-star/aws-3tier-architecture/blob/main/AWS_Infrastructure_Architecture_Report.pdf
