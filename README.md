@@ -65,7 +65,7 @@ aws-3tier-architecture/
 ├── docs/
 │   ├── architecture-diagram.png
 │   ├── AWS_3Tier_Architecture_ADR.pdf
-│   └── AWS_인프라_아키텍처_보고서_A.pdf
+│   └── AWS_인프라_아키텍처_보고서_ADR.pdf
 │
 ├── infrastructure/
 │   └── infrastructure.yaml
