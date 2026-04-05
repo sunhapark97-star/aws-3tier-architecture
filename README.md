@@ -8,7 +8,7 @@ This project demonstrates a **production-grade AWS 3-tier architecture** designe
 
 ## 📌 Architecture Overview
 
-![Architecture](docs/architecture.png)
+https://raw.githubusercontent.com/sunhapark97-star/aws-3tier-architecture/main/docs/architecture-diagram.png
 
 → Detailed design decisions:
 📄 https://github.com/sunhapark97-star/aws-3tier-architecture/blob/main/docs/AWS_3Tier_Architecture_ADR.pdf
